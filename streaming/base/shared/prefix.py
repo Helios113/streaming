@@ -8,6 +8,7 @@ prevent shared resources like shared memory from colliding.
 """
 
 import os
+import uuid
 from collections import Counter
 from tempfile import gettempdir
 from time import sleep
@@ -93,12 +94,35 @@ def _check_self(streams_local: list[str]) -> None:
             f'Reused local directory: {duplicate_local_dirs}. Provide a different one.')
 
 
-def _check_and_find(streams_local: list[str], streams_remote: list[Union[str, None]],
-                    shm_name: str) -> int:
-    """Find the next available prefix while checking existing local dirs for overlap.
+def _make_unique_local_dirs(streams_local: list[str], their_locals: list[str]) -> list[str]:
+    """Make local directories unique by adding a suffix to avoid conflicts.
+    
+    Args:
+        streams_local (List[str]): Original local directories.
+        their_locals (List[str]): Existing local directories that conflict.
+        
+    Returns:
+        List[str]: Modified local directories with unique suffixes.
+    """
+    unique_suffix = str(uuid.uuid4())[:8]
+    modified_dirs = []
+    
+    for local_dir in streams_local:
+        if local_dir and local_dir in their_locals:
+            # Add unique suffix to conflicting directory
+            modified_dirs.append(f"{local_dir}_{unique_suffix}")
+        else:
+            modified_dirs.append(local_dir)
+    
+    return modified_dirs
 
-    Local leader walks the existing shm prefixes starting from zero, verifying that there is no
-    local working directory overlap when remote directories exist. When attaching to an existing
+
+def _check_and_find(streams_local: list[str], streams_remote: list[Union[str, None]],
+                    shm_name: str) -> tuple[int, list[str]]:
+    """Find the next available prefix and resolve any directory conflicts.
+
+    Local leader walks the existing shm prefixes starting from zero, resolving any
+    local working directory conflicts by creating unique directories. When attaching to an existing
     shm fails, we have reached the end of the existing shms. We will register the next one.
 
     Args:
@@ -107,9 +131,10 @@ def _check_and_find(streams_local: list[str], streams_remote: list[Union[str, No
         shm_name (str): The shared memory file name, e.g., LOCALS, BARRIER etc.
 
     Returns:
-        int: Next available prefix int.
+        tuple[int, List[str]]: Next available prefix int and potentially modified local directories.
     """
     prefix_int = 0
+    current_streams_local = streams_local.copy()
 
     for prefix_int in _each_prefix_int():
 
@@ -131,39 +156,35 @@ def _check_and_find(streams_local: list[str], streams_remote: list[Union[str, No
         except PermissionError:
             continue
         except FileNotFoundError:
-            break
+            break  # This prefix is available - no existing shared memory
 
         if shm_name != LOCALS:
             continue
 
         their_locals, _ = _unpack_locals(bytes(shm.buf))
 
-        # Do not check for a conflicting local directories across existing shared memory if
-        # remote directories are None. Get the next prefix.
+        # Check for conflicting local directories and resolve them
         if any(streams_remote):
             # Get the indices of the local directories which matches with the current
             # shared memory.
-            matching_index = np.where(np.isin(streams_local, their_locals))[0]
+            matching_index = np.where(np.isin(current_streams_local, their_locals))[0]
             if matching_index.size > 0:
-                for idx in matching_index:
-                    # If there is a conflicting local directory for a non-None remote directory,
-                    # raise an exception.
-                    if streams_remote[idx] is not None:
-                        raise ValueError(
-                            f'Reused local directory: {streams_local} vs ' +
-                            f'{their_locals}. Provide a different one. If using ' +
-                            f'a unique local directory, try deleting the local directory and ' +
-                            f'call `streaming.base.util.clean_stale_shared_memory()` only once ' +
-                            f'in your script to clean up the stale shared memory before ' +
-                            f'instantiation of `StreamingDataset`.')
-    return prefix_int
+                has_conflicts = any(streams_remote[idx] is not None for idx in matching_index)
+                if has_conflicts:
+                    print("SHM conflict detected.", flush=True)
+                    # Instead of raising error, create unique directories
+                    current_streams_local = _make_unique_local_dirs(current_streams_local, their_locals)
+                    # Continue to next prefix with modified directories
+                    continue
+    
+    return prefix_int, current_streams_local
 
 
 def _check_and_find_retrying(streams_local: list[str], streams_remote: list[Union[str, None]],
-                             shm_name: str, retry: int) -> int:
-    """Find the next available prefix while checking existing dirs for overlap.
+                             shm_name: str, retry: int) -> tuple[int, list[str]]:
+    """Find the next available prefix while resolving directory conflicts.
 
-    If an overlap is found, sleeps for a tick and then tries again, up to "retry" times. We allow
+    If an overlap is found, modifies directories and tries again, up to "retry" times. We allow
     this grace period because modifying python shared memory in a destructor intermediated through
     a numpy array appears to be racy.
 
@@ -174,10 +195,11 @@ def _check_and_find_retrying(streams_local: list[str], streams_remote: list[Unio
         retry (int): Number of retries upon failure before raising an exception.
 
     Returns:
-        int: Next available prefix int.
+        tuple[int, List[str]]: Next available prefix int and potentially modified local directories.
     """
     if retry < 0:
         raise ValueError(f'Specify at least zero retries (provided {retry}).')
+    
     errs = []
     for _ in range(1 + retry):
         try:
@@ -210,10 +232,16 @@ def get_shm_prefix(streams_local: list[str],
     # Check my locals for overlap.
     _check_self(streams_local)
 
-    prefix_int = max([
+    # Find prefix and get potentially modified local directories
+    results = [
         _check_and_find_retrying(streams_local, streams_remote, shm_name=shm_name, retry=retry)
         for shm_name in SHM_TO_CLEAN
-    ])
+    ]
+    
+    # Use the maximum prefix and the local directories from that result
+    prefix_int = max(result[0] for result in results)
+    # Get the modified streams_local from the result that gave us the max prefix
+    final_streams_local = next(result[1] for result in results if result[0] == prefix_int)
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -221,7 +249,7 @@ def get_shm_prefix(streams_local: list[str],
     # First, the local leader registers the first available shm prefix, recording its locals.
     if world.is_local_leader:
         name = _get_path(prefix_int, LOCALS)
-        data = _pack_locals(streams_local, prefix_int)
+        data = _pack_locals(final_streams_local, prefix_int)
         shm = SharedMemory(name, True, len(data))
         shm.buf[:len(data)] = data
 
@@ -239,9 +267,9 @@ def get_shm_prefix(streams_local: list[str],
                                f'different ``local`` parameters from different ranks.')
 
         their_locals, their_prefix_int = _unpack_locals(bytes(shm.buf))
-        if streams_local != their_locals or prefix_int != their_prefix_int:
+        if final_streams_local != their_locals or prefix_int != their_prefix_int:
             raise RuntimeError(f'Internal error: shared memory registered does not match ' +
                                f'local leader as streams_local or prefix_int not match. ' +
                                f'local leader: {their_locals} and {their_prefix_int}. ' +
-                               f'expected: {streams_local} and {prefix_int}.')
+                               f'expected: {final_streams_local} and {prefix_int}.')
     return prefix_int, shm  # pyright: ignore
